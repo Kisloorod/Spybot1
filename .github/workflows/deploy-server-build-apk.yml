@@ -24,8 +24,8 @@ on:
         type: string
 
 env:
-  8630662825:AAEy4BL2qEd8k6pN2pA6cKPCpYsWUr-9QOw: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-  8630662825: ${{ secrets.TELEGRAM_CHAT_ID }}
+  TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+  TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
 jobs:
   deploy-and-build:
@@ -39,7 +39,7 @@ jobs:
       - name: Verify secrets
         shell: bash
         run: |
-          if [ -z "${8630662825:AAEy4BL2qEd8k6pN2pA6cKPCpYsWUr-9QOw}" ] || [ -z "${8630662825}" ]; then
+          if [ -z "${TELEGRAM_BOT_TOKEN}" ] || [ -z "${TELEGRAM_CHAT_ID}" ]; then
             echo "Telegram secrets missing"
             exit 1
           fi
